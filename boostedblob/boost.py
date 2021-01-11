@@ -305,10 +305,8 @@ class MappingBoostable(Boostable[T], Generic[A, T]):
     ) -> None:
         super().__init__(executor)
 
-        if not isinstance(iterable, (Iterator, Boostable, EagerAsyncIterator)):
-            raise ValueError(
-                "Underlying iterable must be an Iterator, Boostable or EagerAsyncIterator"
-            )
+        if not isinstance(iterable, (Iterator, Boostable)):
+            raise ValueError("Underlying iterable must be an Iterator or Boostable")
 
         async def wrapper(arg: A) -> T:
             async with self.executor.semaphore:
@@ -496,6 +494,58 @@ class EnumerateBoostable(Boostable[Tuple[int, T]]):
         return ret
 
 
+class EageriseBoostable(Boostable[T]):
+    def __init__(self, iterable: AsyncIterator[T], executor: BoostExecutor) -> None:
+        super().__init__(executor)
+        self.iterable = iterable
+        self.buffer: Deque[asyncio.Task[T]] = Deque()
+        self.has_semaphore: bool = False
+
+    def provide_boost(self) -> Union[NotReady, Exhausted, asyncio.Task[Any]]:
+        if self.has_semaphore:
+            return Exhausted()  # TODO: backpressure?
+        # TODO: semaphore
+        # TODO: continued use of boost
+        return self.enqueue()
+
+    async def wait(self) -> None:
+        pass  # TODO: check
+
+    def enqueue(self) -> asyncio.Task[T]:
+        # TODO: fix
+        self.next_task = asyncio.create_task(self.iterable.__anext__())
+        return self.next_task
+
+    def dequeue(self) -> Union[NotReady, Exhausted, T]:
+        if not self.buffer or not self.buffer[0].done():
+            return NotReady()
+        task = self.buffer.popleft()
+        # maybe enqueue
+        return task.result()
+
+    async def blocking_dequeue(self) -> T:
+        while True:
+            if not self.buffer:
+                pass  # TODO: enqueue
+            ret = self.dequeue()
+            if not isinstance(ret, (NotReady, Exhausted)):
+                return ret
+            # note that dequeues are racy, so we can't return the result of self.buffer[0] instead,
+            # we just take it as a signal that something is likely ready, and loop and try to
+            # dequeue
+            await self.buffer[0]
+
+    def __aiter__(self) -> AsyncIterator[T]:
+        # TODO: semaphore logi
+        async def iterator() -> AsyncIterator[T]:
+            try:
+                while True:
+                    yield await self.blocking_dequeue()
+            except StopAsyncIteration:
+                pass
+
+        return iterator()
+
 class EagerAsyncIterator(Generic[T]):
     """Like an AsyncIterator, but eager.
 
@@ -535,14 +585,12 @@ class EagerAsyncIterator(Generic[T]):
 
 
 # see docstring of Boostable
-BoostUnderlying = Union[Iterator[T], Boostable[T], EagerAsyncIterator[T]]
+BoostUnderlying = Union[Iterator[T], Boostable[T]]
 
 
 def dequeue_underlying(iterable: BoostUnderlying[T]) -> Union[NotReady, Exhausted, T]:
     """Like ``dequeue``, but abstracts over a BoostUnderlying."""
     if isinstance(iterable, Boostable):
-        return iterable.dequeue()
-    if isinstance(iterable, EagerAsyncIterator):
         return iterable.dequeue()
     if isinstance(iterable, Iterator):
         try:
@@ -556,8 +604,6 @@ async def blocking_dequeue_underlying(iterable: BoostUnderlying[T]) -> T:
     """Like ``blocking_dequeue``, but abstracts over a BoostUnderlying."""
     if isinstance(iterable, Boostable):
         return await iterable.blocking_dequeue()
-    if isinstance(iterable, EagerAsyncIterator):
-        return await iterable.__anext__()
     if isinstance(iterable, Iterator):
         try:
             return next(iterable)
@@ -568,7 +614,7 @@ async def blocking_dequeue_underlying(iterable: BoostUnderlying[T]) -> T:
 
 async def iter_underlying(iterable: BoostUnderlying[T]) -> AsyncIterator[T]:
     """Like ``iter``, but abstracts over a BoostUnderlying."""
-    if isinstance(iterable, (Boostable, EagerAsyncIterator)):
+    if isinstance(iterable, Boostable):
         async for x in iterable:
             yield x
     elif isinstance(iterable, Iterator):
